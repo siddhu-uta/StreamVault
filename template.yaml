@@ -1,0 +1,460 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  StreamVault — Serverless event ingestion pipeline.
+  API Gateway → Lambda → SQS → Lambda → DynamoDB + S3.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parameters
+# ═══════════════════════════════════════════════════════════════════════════════
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Global defaults applied to every Lambda function
+# ═══════════════════════════════════════════════════════════════════════════════
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 128
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        POWERTOOLS_SERVICE_NAME: streamvault
+  Api:
+    TracingEnabled: true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Resources
+# ═══════════════════════════════════════════════════════════════════════════════
+Resources:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Cognito User Pool
+  # ─────────────────────────────────────────────────────────────────────────────
+  StreamVaultUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "streamvault-${Environment}-pool"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true # No self-signup
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+
+  StreamVaultUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref StreamVaultUserPool
+      ClientName: !Sub "streamvault-${Environment}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SNS Topic (alerts)
+  # ─────────────────────────────────────────────────────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "streamvault-${Environment}-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SQS Dead Letter Queue
+  # ─────────────────────────────────────────────────────────────────────────────
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "streamvault-events-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600 # 14 days in seconds
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SQS Main Queue
+  # ─────────────────────────────────────────────────────────────────────────────
+  EventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "streamvault-events-queue-${Environment}"
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 345600 # 4 days in seconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventsDLQ.Arn
+        maxReceiveCount: 3
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # DynamoDB Table
+  # ─────────────────────────────────────────────────────────────────────────────
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "streamvault-events-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_type
+          AttributeType: S
+        - AttributeName: ingested_at
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_type
+          KeyType: HASH
+        - AttributeName: ingested_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: user-id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: ingested_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # S3 Archival Bucket
+  # ─────────────────────────────────────────────────────────────────────────────
+  EventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "streamvault-events-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArchives
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # API Gateway REST API
+  # ─────────────────────────────────────────────────────────────────────────────
+  StreamVaultApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "streamvault-api-${Environment}"
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt StreamVaultUserPool.Arn
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 200
+          ThrottlingRateLimit: 100
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Ingest Lambda
+  # ─────────────────────────────────────────────────────────────────────────────
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "streamvault-ingest-${Environment}"
+      CodeUri: src/ingest/
+      Handler: handler.handler
+      Description: "Validates and enqueues single events to SQS"
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref EventsQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventsQueue.QueueName
+      Events:
+        PostEvent:
+          Type: Api
+          Properties:
+            Path: /events
+            Method: POST
+            RestApiId: !Ref StreamVaultApi
+
+  IngestBatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "streamvault-ingest-batch-${Environment}"
+      CodeUri: src/ingest/
+      Handler: handler.batch_handler
+      Description: "Validates and batch-enqueues up to 100 events to SQS"
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref EventsQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventsQueue.QueueName
+      Events:
+        PostBatch:
+          Type: Api
+          Properties:
+            Path: /events/batch
+            Method: POST
+            RestApiId: !Ref StreamVaultApi
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "streamvault-health-${Environment}"
+      CodeUri: src/ingest/
+      Handler: handler.health_handler
+      Description: "Health check — no auth required"
+      Events:
+        GetHealth:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+            RestApiId: !Ref StreamVaultApi
+            Auth:
+              Authorizer: NONE
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Processor Lambda
+  # ─────────────────────────────────────────────────────────────────────────────
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "streamvault-processor-${Environment}"
+      CodeUri: src/processor/
+      Handler: handler.handler
+      Description: "Reads SQS messages and writes to DynamoDB + S3"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EventsTable
+          BUCKET_NAME: !Ref EventsBucket
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref EventsTable
+        - S3WritePolicy:
+            BucketName: !Ref EventsBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt EventsQueue.QueueName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventsQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Analytics Lambda
+  # ─────────────────────────────────────────────────────────────────────────────
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "streamvault-analytics-${Environment}"
+      CodeUri: src/analytics/
+      Handler: handler.handler
+      Description: "Serves analytics queries on top of DynamoDB"
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EventsTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt EventsTable.Arn
+                - !Sub "${EventsTable.Arn}/index/user-id-index"
+      Events:
+        GetEvents:
+          Type: Api
+          Properties:
+            Path: /analytics/events
+            Method: GET
+            RestApiId: !Ref StreamVaultApi
+        GetSummary:
+          Type: Api
+          Properties:
+            Path: /analytics/summary
+            Method: GET
+            RestApiId: !Ref StreamVaultApi
+        GetUserEvents:
+          Type: Api
+          Properties:
+            Path: /analytics/user/{user_id}
+            Method: GET
+            RestApiId: !Ref StreamVaultApi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CloudWatch Alarms
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # Alarm: Processing errors > 10 in 5 minutes
+  ProcessingErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "streamvault-${Environment}-processing-errors"
+      AlarmDescription: "Too many processor Lambda errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # Alarm: DLQ depth > 0
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "streamvault-${Environment}-dlq-depth"
+      AlarmDescription: "Messages have landed in the Dead Letter Queue"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventsDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Alarm: Lambda duration approaching 30s timeout
+  ProcessorDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "streamvault-${Environment}-processor-duration"
+      AlarmDescription: "Processor Lambda duration approaching timeout"
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Alarm: API Gateway 5XX errors
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "streamvault-${Environment}-api-5xx"
+      AlarmDescription: "API Gateway returning 5XX errors"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "streamvault-api-${Environment}"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Outputs
+# ═══════════════════════════════════════════════════════════════════════════════
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway base URL"
+    Value: !Sub "https://${StreamVaultApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "streamvault-${Environment}-api-endpoint"
+
+  TableName:
+    Description: "DynamoDB events table name"
+    Value: !Ref EventsTable
+    Export:
+      Name: !Sub "streamvault-${Environment}-table"
+
+  QueueUrl:
+    Description: "SQS events queue URL"
+    Value: !Ref EventsQueue
+    Export:
+      Name: !Sub "streamvault-${Environment}-queue-url"
+
+  DLQUrl:
+    Description: "SQS dead letter queue URL"
+    Value: !Ref EventsDLQ
+    Export:
+      Name: !Sub "streamvault-${Environment}-dlq-url"
+
+  BucketName:
+    Description: "S3 archival bucket name"
+    Value: !Ref EventsBucket
+    Export:
+      Name: !Sub "streamvault-${Environment}-bucket"
+
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref StreamVaultUserPool
+    Export:
+      Name: !Sub "streamvault-${Environment}-user-pool-id"
+
+  UserPoolClientId:
+    Description: "Cognito App Client ID"
+    Value: !Ref StreamVaultUserPoolClient
+    Export:
+      Name: !Sub "streamvault-${Environment}-user-pool-client-id"
