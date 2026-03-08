@@ -1,0 +1,23 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "streamvault-dev"
+region = "us-east-1"
+
+[dev.deploy.parameters]
+stack_name = "streamvault-dev"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=dev AlertEmail=vnksiddhu@gmail.com"
+s3_prefix = "streamvault-dev"
+resolve_s3 = true
+
+[prod.deploy.parameters]
+stack_name = "streamvault-prod"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=prod AlertEmail=vnksiddhu@gmail.com"
+s3_prefix = "streamvault-prod"
+resolve_s3 = true

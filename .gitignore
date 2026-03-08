@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.venv/
+venv/
+env/
+.env
+
+# SAM / AWS
+.aws-sam/
+samconfig.toml.bak
+packaged.yaml
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+*.pem
+*.key
+credentials
+
+# Pytest
+.pytest_cache/
+
+# Node.js / Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+
+# Vite / Build output
+streamvault-companion/dist/
+streamvault-companion/.vite/
+*.local
+
+# Logs
+logs/
+*.log
