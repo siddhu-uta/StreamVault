@@ -1,0 +1,155 @@
+name: StreamVault CI/CD
+
+on:
+    push:
+        branches: ["**"]
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: "Deploy to environment"
+                required: true
+                default: "prod"
+                type: choice
+                options: [prod]
+
+jobs:
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Job 1: Unit tests — runs on every push
+    # ─────────────────────────────────────────────────────────────────────────────
+    test:
+        name: Unit Tests
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                python-version: ["3.12"]
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Python ${{ matrix.python-version }}
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ matrix.python-version }}
+
+            - name: Cache pip dependencies
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cache/pip
+                  key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+                  restore-keys: |
+                      ${{ runner.os }}-pip-
+
+            - name: Install test dependencies
+              run: |
+                  pip install pytest pytest-cov moto[sqs,dynamodb,s3] boto3 python-json-logger aws-xray-sdk
+
+            - name: Install Lambda function dependencies
+              run: |
+                  pip install -r src/ingest/requirements.txt
+                  pip install -r src/processor/requirements.txt
+                  pip install -r src/analytics/requirements.txt
+
+            - name: Run unit tests with coverage
+              run: |
+                  pytest tests/unit/ -v --cov=src --cov-report=term-missing --cov-report=xml
+              env:
+                  AWS_DEFAULT_REGION: us-east-1
+                  AWS_ACCESS_KEY_ID: testing
+                  AWS_SECRET_ACCESS_KEY: testing
+                  AWS_SECURITY_TOKEN: testing
+                  AWS_SESSION_TOKEN: testing
+
+            - name: Upload coverage report
+              uses: codecov/codecov-action@v4
+              with:
+                  file: ./coverage.xml
+              continue-on-error: true
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Job 2: Deploy to dev — runs on push to main only
+    # ─────────────────────────────────────────────────────────────────────────────
+    deploy-dev:
+        name: Deploy to Dev
+        runs-on: ubuntu-latest
+        needs: test
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        environment: dev
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Python 3.12
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                  aws-region: us-east-1
+
+            - name: Install AWS SAM CLI
+              uses: aws-actions/setup-sam@v2
+
+            - name: SAM Build
+              run: sam build --use-container
+
+            - name: SAM Deploy (dev)
+              run: |
+                  sam deploy --config-env dev \
+                    --parameter-overrides \
+                      "Environment=dev" \
+                      "AlertEmail=${{ secrets.ALERT_EMAIL }}" \
+                    --no-confirm-changeset \
+                    --no-fail-on-empty-changeset
+
+            - name: Run integration tests
+              run: |
+                  API_URL=$(aws cloudformation describe-stacks \
+                    --stack-name streamvault-dev \
+                    --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
+                    --output text)
+                  API_URL=$API_URL pytest tests/integration/ -v
+              env:
+                  AWS_DEFAULT_REGION: us-east-1
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Job 3: Deploy to prod — manual trigger only
+    # ─────────────────────────────────────────────────────────────────────────────
+    deploy-prod:
+        name: Deploy to Prod
+        runs-on: ubuntu-latest
+        needs: test
+        if: github.event_name == 'workflow_dispatch'
+        environment: prod
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Python 3.12
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                  aws-region: us-east-1
+
+            - name: Install AWS SAM CLI
+              uses: aws-actions/setup-sam@v2
+
+            - name: SAM Build
+              run: sam build --use-container
+
+            - name: SAM Deploy (prod)
+              run: |
+                  sam deploy --config-env prod \
+                    --parameter-overrides \
+                      "Environment=prod" \
+                      "AlertEmail=${{ secrets.ALERT_EMAIL }}" \
+                    --no-fail-on-empty-changeset
