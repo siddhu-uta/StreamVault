@@ -1,0 +1,210 @@
+# StreamVault — Architecture Decisions
+
+> Every decision here was made consciously. Alternatives were considered.
+> This document is the companion to the codebase, not a repeat of it.
+
+---
+
+## 1. Ingest ↔ Processor Decoupling via SQS
+
+**Decision:** The Ingest Lambda writes to SQS and immediately returns `202 Accepted`. A
+separate Processor Lambda asynchronously reads from SQS and persists to DynamoDB + S3.
+
+**Why not write directly from Ingest to DynamoDB?**
+- If DynamoDB is slow or throttled, the Ingest Lambda blocks, and the API response time
+  degrades for every client.
+- If DynamoDB is completely down, all ingestion fails with 500s.
+- With SQS in between, Ingest always returns in under 50ms regardless of downstream
+  health. Clients get fast acknowledgement, and the message is durably held in SQS.
+
+**Tradeoff:** Events are not immediately queryable in analytics after a successful `202`.
+There's a pipeline delay of a few seconds. For analytics use cases, this is acceptable;
+for transactional systems (e.g., payment confirmation), it would not be.
+
+**Alternative considered:** Kinesis Data Streams instead of SQS.
+Kinesis would allow multiple consumers to replay the same stream, which is useful if you
+later want to add a real-time ML scoring consumer. But Kinesis has a minimum cost even in
+the free tier (provisioned shards) and adds operational complexity. SQS is zero-cost at
+our scale and simpler to operate. We'd migrate to Kinesis if we needed fan-out consumers.
+
+---
+
+## 2. SQS Standard vs. FIFO
+
+**Decision:** Standard queue.
+
+**Why not FIFO?**
+- FIFO guarantees exactly-once, in-order delivery. Standard is at-least-once, best-effort.
+- FIFO has a throughput limit of 3,000 messages/second per API call (300 without batching).
+  Standard is effectively unlimited.
+- We handle duplicates via DynamoDB's `ConditionExpression` on `event_id`. That's idempotent
+  processing, which makes FIFO's guarantees redundant for our use case.
+- Strict ordering is not required for analytics events. If two page views arrive slightly
+  out of order, the analytics are not meaningfully affected.
+
+**Conclusion:** Standard queue is the right call here. If we were processing financial
+transactions where ordering mattered, FIFO would be mandatory.
+
+---
+
+## 3. DynamoDB Schema: Partition Key = event_type, Sort Key = ingested_at
+
+**Decision:** Use `event_type` as partition key and `ingested_at` (ISO 8601 string) as sort key.
+
+**Why this design?**
+- The overwhelmingly common query is: "Give me all events of type X between timestamp A and B."
+- This query maps to a DynamoDB *Query* operation, not a *Scan*. Query uses the index efficiently.
+  Scan reads the entire table — at scale, this is hundreds of times more expensive.
+- ISO 8601 strings sort lexicographically in the same order as chronological order.
+  `2026-03-04T14:00:00` < `2026-03-04T15:00:00` — correct ordering, no conversion needed.
+
+**Alternative considered:** UUID as partition key with a GSI on event_type.
+This would distribute writes more evenly across partitions. But all our reads would then
+need to go through the GSI, and we lose the ability to do a range query on ingested_at
+within a single partition directly. Our write volume (free tier) is nowhere near the point
+where event_type partition hotspotting becomes a problem.
+
+**What changes at scale?**
+At very high write volume, a single popular event_type (e.g., `"page_view"`) could become
+a hot partition. The mitigation is "write sharding" — prefixing the partition key with a
+random shard suffix (`"page_view#3"`) and using a scatter-gather query across shards. We'd
+implement this if a single event type exceeded ~1,000 writes/second.
+
+---
+
+## 4. DynamoDB + S3 Dual Write (Hot + Cold Storage)
+
+**Decision:** Processor writes to both DynamoDB and S3.
+
+**Why DynamoDB?**
+- Fast millisecond-latency queries for the analytics API.
+- Supports our specific query patterns (by type+time, by user).
+- TTL automatically removes old data, staying within the 25 GB free tier.
+
+**Why S3 as well?**
+- S3 is cheap archival ($0.023/GB/month vs DynamoDB's more complex pricing).
+- After 7 days (DynamoDB TTL), the data is gone from DynamoDB but survives in S3 for 30 days.
+- S3 enables future large-scale analytics via Athena, Glue, or Spark — just point them at
+  the `events/` prefix. No data migration needed.
+- S3 JSON Lines format is the lingua franca of data engineering.
+
+**S3 key structure:** `events/YYYY/MM/DD/HH/batch-{uuid}.jsonl`
+This Hive-partitioned structure lets Athena query by date range without a full table scan.
+
+---
+
+## 5. Idempotent Processing
+
+**Decision:** Use DynamoDB `ConditionExpression: attribute_not_exists(event_id)` on every put.
+
+**The problem:** SQS Standard queues guarantee *at-least-once* delivery. The same message
+can arrive twice. Without idempotency, we'd write duplicate rows to DynamoDB.
+
+**The solution:** `event_id` is a UUID generated by the Ingest Lambda when it first receives
+an event. If the Processor sees the same `event_id` twice, the second `put_item` raises a
+`ConditionalCheckFailedException`. We log a warning and treat the message as successfully
+processed (return it as success, not failure). SQS does not redeliver it.
+
+**What about S3?** Writing the same event twice to S3 JSON Lines produces a duplicate line.
+Since S3 is archival and the Athena queries de-duplicate by `event_id`, this is acceptable.
+If strict S3 de-duplication were required, we'd use AWS Glue Streaming with checkpointing.
+
+---
+
+## 6. Cognito JWT Auth vs. API Keys
+
+**Decision:** Cognito User Pool JWT auth on all non-health endpoints.
+
+**Why Cognito over API keys?**
+- API keys in API Gateway are not access control — AWS explicitly states they are for usage
+  plans, not authentication. Any client can distribute an API key, and revocation requires
+  changing the key for all clients.
+- Cognito tokens are short-lived (1-hour access tokens). Refresh tokens can be revoked
+  per-user without touching other users.
+- JWTs contain identity claims. We can extract `user_id` from the token server-side in a
+  future Auth Lambda, preventing clients from impersonating other users.
+- We chose admin-only user creation (`AllowAdminCreateUserOnly: true`) because this is an
+  internal analytics API, not a public consumer product.
+
+**Tradeoff:** Cognito adds ~10ms of validation latency at the API Gateway edge (not in Lambda).
+For our use case, this is negligible.
+
+---
+
+## 7. ReportBatchItemFailures for Partial SQS Batch Failures
+
+**Decision:** Processor is configured with `FunctionResponseTypes: [ReportBatchItemFailures]`.
+
+**Why this matters:** Lambda processes SQS events in batches of up to 10. Without
+`ReportBatchItemFailures`, if message #3 fails processing, Lambda can only signal "the
+whole batch failed" (by raising an exception) or "the whole batch succeeded" (by returning
+normally). The first means messages #1, #2, #4–10 are retried unnecessarily. The second
+means #3 is silently dropped.
+
+**With `ReportBatchItemFailures`:** Lambda returns a JSON body listing exactly which
+`messageId` values failed. SQS retries only those messages. Correctly-processed messages
+are acknowledged and deleted. This is the correct, production-grade behavior.
+
+**After 3 failures:** A message with `maxReceiveCount: 3` that fails 3 times is moved to
+the DLQ. The DLQ has 14-day retention and triggers a CloudWatch Alarm immediately.
+Operations (you) investigate, fix the bug, and replay from the DLQ.
+
+---
+
+## 8. IAM — Principle of Least Privilege
+
+Each Lambda has exactly the permissions it needs and nothing else:
+
+| Lambda     | Permissions                                                 |
+|------------|-------------------------------------------------------------|
+| Ingest     | `sqs:SendMessage` on the single main queue                  |
+| Processor  | `sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes` on queue, `dynamodb:PutItem` on table, `s3:PutObject` on bucket |
+| Analytics  | `dynamodb:Query` on table ARN + GSI ARN only                |
+
+**Why this matters:** If the Ingest Lambda is compromised, the attacker can write to SQS
+but cannot read DynamoDB, cannot write S3, cannot access Cognito. Blast radius is bounded.
+This is called "defense in depth" and is a favorite interview topic.
+
+---
+
+## 9. CloudWatch Structured Logging + EMF
+
+**Decision:** All Lambdas log in JSON via `python-json-logger` and use Embedded Metric Format.
+
+**Why structured logging?**
+Plain string logs like `"Processing event 123"` cannot be filtered or aggregated.
+CloudWatch Logs Insights treats them as opaque strings.
+
+JSON logs like `{"event_id": "abc", "duration_ms": 45, "level": "INFO"}` are queryable:
+```
+filter level = "ERROR"
+| stats count() by event_type
+| sort count desc
+```
+
+**Why EMF over `put_metric_data`?**
+EMF embeds metric directives in the log JSON. CloudWatch parses them asynchronously.
+* No extra API calls from Lambda.
+* No extra cost (metrics are free up to 10 custom metrics).
+* No cold-start penalty from an extra SDK client.
+
+---
+
+## 10. What I'd Change at 10x Load
+
+Current: 100 WCU (on-demand) DynamoDB, 1 SQS queue, 128 MB Lambda memory.
+
+At 10x:
+1. **DynamoDB:** Enable DynamoDB Accelerator (DAX) in front of the analytics table. DAX
+   provides microsecond read latency for the hot `GET /analytics/summary` endpoint.
+2. **SQS:** Add a second queue for high-priority events (purchases, errors) with dedicated
+   concurrency on the Processor Lambda. Normal events route to the existing queue.
+3. **Lambda memory:** Increase Processor to 256 MB. Memory and CPU scale together in Lambda.
+   If processing speed is the bottleneck, more memory = faster = fewer timeout risks.
+4. **Write sharding:** Implement the `event_type#{shard_id}` partition key pattern for hot
+   event types.
+5. **Read replicas:** Use DynamoDB Global Tables if analytics consumers are in multiple
+   regions. Adds < 1 second replication lag.
+6. **S3 → Athena pipeline:** At 10x, real-time DynamoDB queries may be too slow for
+   complex analytics. Add an AWS Glue job to compact the S3 JSON Lines into Parquet
+   partitions for Athena queries — orders of magnitude faster and cheaper at scale.
